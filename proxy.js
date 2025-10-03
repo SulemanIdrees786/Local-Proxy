@@ -1,11 +1,41 @@
 
-// advanced-stealth-proxy.js
+
+
+// advanced-stealth-proxy.patched.js
+// This is your original advanced-stealth-proxy.js with non-destructive additions:
+// - integrates proxy-helper (as optional) without removing any original logic
+// - adds basic-auth check (configurable) before handling requests and CONNECT
+// - adds upstream request timeouts and socket idle timeouts
+// - supports optional TLS server via env USE_TLS (load certs with PROXY_TLS_KEY/PROXY_TLS_CERT)
+// All original code blocks are kept; new code is added and marked with comments starting with "// <<< ADD".
+
+const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const net = require('net');
 const crypto = require('crypto');
 const url = require('url');
 const Proxy = require('http-mitm-proxy'); // optional for MITM TLS
+
+// <<< ADD: optionally load helper utilities if present
+let helper = null;
+try {
+  helper = require('./Proxy-helper');
+  // configure helper from env if available
+  helper.setConfig({
+    username: process.env.PROXY_USER || helper.DEFAULT_CONFIG.username,
+    password: process.env.PROXY_PASS || helper.DEFAULT_CONFIG.password,
+    timeoutMs: process.env.UPSTREAM_TIMEOUT ? parseInt(process.env.UPSTREAM_TIMEOUT, 10) : helper.DEFAULT_CONFIG.timeoutMs,
+    socketTimeoutMs: process.env.SOCKET_TIMEOUT ? parseInt(process.env.SOCKET_TIMEOUT, 10) : helper.DEFAULT_CONFIG.socketTimeoutMs,
+    maxSockets: process.env.MAX_SOCKETS ? parseInt(process.env.MAX_SOCKETS, 10) : helper.DEFAULT_CONFIG.maxSockets,
+    verboseLogging: !!process.env.VERBOSE_LOG,
+    requireAuth: process.env.REQUIRE_AUTH !== '0'
+  });
+  console.log('[proxy] proxy-helper loaded.');
+} catch (e) {
+  console.log('[proxy] proxy-helper not found or failed to load — running without helper enhancements.');
+}
+// <<< END ADD
 
 class AdvancedStealthProxy {
   constructor() {
@@ -302,6 +332,20 @@ selfCheck(timeoutMs = 8000) {
       this.connectionPool.set(requestId, { req, res, startTime: Date.now() });
       console.log('   ' + this.getRandomFunnyMessage());
 
+      // <<< ADD: Basic auth check (if helper loaded and configured)
+      if (helper) {
+        const auth = helper.checkBasicAuth(req);
+        if (!auth.ok) {
+          if (!res.headersSent) {
+            res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="SecureProxy"' });
+            res.end('Proxy Authentication Required: ' + (auth.reason || ''));
+          }
+          this.connectionPool.delete(requestId);
+          return;
+        }
+      }
+      // <<< END ADD
+
       // Determine hostname/port and path robustly
       let targetHostname;
       let targetPort;
@@ -379,12 +423,45 @@ const proxyReq = requestLib.request(options, (proxyRes) => {
         this.connectionPool.delete(requestId);
       });
 
+      // <<< ADD: set upstream timeout and link client socket close to upstream abort
+      try {
+        if (helper) {
+          proxyReq.setTimeout(helper.DEFAULT_CONFIG.timeoutMs || 15000, () => {
+            console.warn('[proxy] upstream request timed out for', targetHostname);
+            proxyReq.abort();
+          });
+        } else {
+          proxyReq.setTimeout(15000, () => { proxyReq.abort(); });
+        }
+      } catch (e) {}
+
+      if (req.socket) {
+        req.socket.on('close', () => {
+          try { proxyReq.destroy(); } catch (e) {}
+        });
+      }
+      // <<< END ADD
+
       req.pipe(proxyReq);
     });
 
     // HTTPS CONNECT (tunnel) - respects true TLS
     server.on('connect', (req, clientSocket, head) => {
       const requestId = this.logRequest(req, 'HTTPS');
+
+    // <<< ADD: auth for CONNECT if helper available
+     if (helper) {
+        const auth = helper.checkBasicAuth(req);
+        if (!auth.ok) {
+          try {
+            clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="SecureProxy"\r\n\r\n');
+          } catch (e) {}
+          clientSocket.end();
+          return this.connectionPool.delete(requestId);
+        }
+      }
+      // <<< END ADD
+
       const [host, port] = req.url.split(':');
       const targetPort = parseInt(port, 10) || 443;
 
@@ -395,6 +472,14 @@ const proxyReq = requestLib.request(options, (proxyRes) => {
         clientSocket.pipe(serverSocket);
         serverSocket.pipe(clientSocket);
       });
+
+      // <<< ADD: socket idle timeouts if helper configured
+      try {
+        const sockTimeout = (helper && helper.DEFAULT_CONFIG && helper.DEFAULT_CONFIG.socketTimeoutMs) ? helper.DEFAULT_CONFIG.socketTimeoutMs : 30000;
+        serverSocket.setTimeout(sockTimeout, () => serverSocket.destroy());
+        clientSocket.setTimeout(sockTimeout, () => clientSocket.destroy());
+      } catch (e) {}
+      // <<< END ADD
 
       serverSocket.on('error', (err) => {
         console.error(`   ❌ HTTPS Error: ${err.message}`);
@@ -434,6 +519,27 @@ this.selfCheck(); // single immediate check
 // optional: periodic check every N ms (be conservative, e.g. every 5-10 minutes)
 this._selfCheckInterval = setInterval(() => this.selfCheck(), 1000 * 60 * 5);
     } else {
+      // <<< ADD: Optional TLS server support — only enabled when USE_TLS=1
+      if (process.env.USE_TLS === '1' && helper) {
+        try {
+          const keyPath = process.env.PROXY_TLS_KEY || process.env.TLS_KEY || null;
+          const certPath = process.env.PROXY_TLS_CERT || process.env.TLS_CERT || null;
+          if (!keyPath || !certPath) throw new Error('TLS key/cert not provided');
+          const tlsOpts = helper.loadTlsOptions({ keyPath, certPath, caPath: process.env.PROXY_TLS_CA || null });
+          const httpsServer = https.createServer(tlsOpts, (req, res) => this.createHttpServer().emit('request', req, res));
+          httpsServer.on('connect', (req, clientSocket, head) => this.createHttpServer().emit('connect', req, clientSocket, head));
+          httpsServer.listen(this.port, this.host, () => console.log(`🚀 Advanced Stealth Proxy (HTTPS) running at ${this.host}:${this.port}`));
+          console.log('Proxy started — running initial self-check...');
+          this.selfCheck();
+          this._selfCheckInterval = setInterval(() => this.selfCheck(), 1000 * 60 * 5);
+          return; // TLS server started, skip regular server start below
+        } catch (e) {
+          console.error('[proxy] TLS startup failed:', e.message);
+          console.error('[proxy] Continuing to start non-TLS server.');
+        }
+      }
+      // <<< END ADD
+
       const server = this.createHttpServer();
       server.listen(this.port, this.host, () => {
         console.log(`🚀 Advanced Stealth Proxy (tunnel mode) running at ${this.host}:${this.port}`);
@@ -460,4 +566,4 @@ const proxy = new AdvancedStealthProxy();
 proxy.start();
 
 module.exports = AdvancedStealthProxy;
-// advanced-stealth-proxy.js
+// advanced-stealth-proxy.patched.js
